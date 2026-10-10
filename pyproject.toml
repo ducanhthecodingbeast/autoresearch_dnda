@@ -14,6 +14,11 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "torch==2.9.1",
+    # Experiments are notebooks (research-program.md section 3.2), executed headless via
+    # `jupyter nbconvert --execute`. ipykernel is what actually runs the cells.
+    "nbconvert>=7.16.0",
+    "nbformat>=5.10.0",
+    "ipykernel>=6.29.0",
 ]
 
 [tool.uv.sources]

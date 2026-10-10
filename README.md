@@ -37,25 +37,77 @@ uv run prepare.py
 uv run train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+If the above commands all work ok, your setup is working and you can go into autonomous
+research mode. In this fork that means starting at Round 0 — see
+[`program.md`](program.md). Note that `--num-shards 10` is the upstream default; Round 0
+measures your platform's throughput and tells you the shard count this protocol actually
+needs (32 on an H100), plus the command to fetch the held-out test shard.
+
+## This fork: a three-round protocol with human gates
+
+This fork replaces the single overnight loop with a staged protocol. The full
+specification is in **[`research-program.md`](research-program.md)**; the agent's entry
+point is [`program.md`](program.md).
+
+| Round | Data | Budget | Purpose |
+|---|---|---|---|
+| R0 | 1/4 | 120 s | Baseline, throughput sizing, **σ₀** (the noise band) |
+| R1 | 1/4 | 120 s | Wide screening — many cheap runs, coarse knobs |
+| R2 | 1/2 | 300 s | Confirm R1 survivors at larger scale |
+| R3 | full | 900 s | Final config, held-out test-shard confirmation |
+
+Three differences from upstream, each fixing something that bites over ~100 runs:
+
+1. **A keep must clear 2σ.** Upstream keeps any run with a lower `val_bpb`. At a
+   5-minute budget much of that difference is seed noise, and greedily hill-climbing on
+   noise manufactures wins that vanish on a rerun. σ is measured from three seed repeats
+   of each round's baseline, and `ledger.verdict()` decides — not the agent's judgment.
+2. **The time budget scales with the rounds.** Upstream fixes wall-clock at 300 s, so a
+   run consumes the same token count whatever the dataset size — scaling data alone
+   would give three rounds that cost the same and differ only in which documents they
+   saw. An **epoch gate** (`epoch < 1.0`, enforced in every run) keeps any round from
+   silently training on repeats.
+3. **A held-out test shard.** Across three rounds of hill-climbing on one pinned
+   validation shard you *will* overfit it. Shard 6541 stays untouched until the Round 3
+   gate, and `test_bpb − val_bpb` is the headline result.
+
+Each experiment is a folder — `exp01r1`, `exp02r1`, `exp01r2` — containing
+`preprocessing.py`, `train.ipynb`, and a `report.md` with benchmarks, a score, an
+assessment, and numbered evidence for every claim.
 
 ## Running the agent
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Spin up your Claude/Codex in this repo and point it at the entry file:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+Have a look at program.md and let's start Round 0.
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+The agent stops at every round gate and waits for you.
 
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py                  constants, data prep + runtime utilities (READ-ONLY)
+train.py                    upstream reference; not run after R0, kept for diffing
+program.md                  agent entry point
+research-program.md         the protocol: rounds, decision rule, contracts
+analysis.ipynb              round-aware analysis of results.tsv
+experiments/
+  _shared/                  model.py, harness.py, data.py, ledger.py
+  _template/                copy this to start an experiment
+  exp00r0/                  baseline + noise measurement
+  exp<NN>r<R>/              preprocessing.py, train.ipynb, report.md, metrics.json
+rounds/                     per-round direction lists and assessments
+results.tsv                 append-only ledger (untracked)
+pyproject.toml              dependencies
+```
+
+The two logic modules carry their own self-checks, which need no GPU:
+
+```bash
+uv run python -m experiments._shared.data --check     # round slices, epoch sizing
+uv run python -m experiments._shared.ledger --check   # the 2-sigma decision rule
 ```
 
 ## Design choices

@@ -2,6 +2,19 @@
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
+
+UPSTREAM REFERENCE — NOT THE EXPERIMENT PATH IN THIS FORK.
+
+This project runs experiments as notebooks under experiments/, driven by the protocol
+in research-program.md. This file is kept unmodified for two reasons:
+
+  1. experiments/_shared/model.py is a verbatim extraction of lines 7-25 and 28-427
+     below. Diff against this file to see what an experiment actually changed.
+  2. It is the sanity check that the environment works (`uv run train.py`).
+
+Do not edit it, and do not run it after Round 0 - its hyperparameters are module
+globals and its time budget comes from prepare.TIME_BUDGET, so it ignores the round
+ladder entirely. Edit experiments/_shared/ and the experiment's own notebook instead.
 """
 
 import os
