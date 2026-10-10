@@ -29,15 +29,28 @@ import prepare
 
 # --- Project constants. Section 2 of research-program.md. Pin once, never per-run. ---
 
-SHARD_BUDGET = 44          # "full dataset". Derive it from measured throughput (see below).
+SHARD_BUDGET = 32          # "full dataset". THE COMPUTE DIAL - see round_tokens() below.
 TEST_SHARD = 6541          # held out until the Round 3 gate. VAL_SHARD (6542) is prepare.py's.
-SHARD_TOKENS = 61_000_000  # ~400B ClimbMix tokens / 6542 shards
+SHARD_TOKENS = 61_000_000  # ~400B ClimbMix tokens / 6542 shards. Correct after R0.
 
 ROUND_SCALE = {0: 0.25, 1: 0.25, 2: 0.5, 3: 1.0}   # section 1. the ONLY round axis.
 
-# Every round trains for the same wall clock: prepare.TIME_BUDGET (300s, upstream's
-# fixed 5 minutes). Rounds differ by data scale alone, so a result is never confounded
-# by having had more training time than the run it is compared against.
+# There is NO time limit. A run ends when it has made one pass over its round's data,
+# so compute scales with data and the rounds form a 1x / 2x / 4x ladder:
+#
+#   R1  1/4 data  ->  1x compute
+#   R2  1/2 data  ->  2x compute
+#   R3  full data ->  4x compute
+#
+# Two things follow, and they are the point:
+#   - Every run inside a round trains on exactly the same tokens, so two runs are never
+#     separated by one having seen more data. It is the cleanest comparison available.
+#   - epoch == 1.0 by construction, so the epoch gate is satisfied by definition rather
+#     than by sizing a budget against measured throughput.
+#
+# SHARD_BUDGET sets the absolute scale of the whole project: how long a run takes is
+# whatever one pass over that much data costs on your hardware. Raise it for a more
+# serious project, lower it to iterate faster. Nothing else depends on the value.
 
 
 def round_shards(round_idx, shard_budget=SHARD_BUDGET):
@@ -47,35 +60,26 @@ def round_shards(round_idx, shard_budget=SHARD_BUDGET):
     return list(range(n))
 
 
-def required_shard_budget(throughput_tokens_per_s, headroom=1.25):
+def round_tokens(round_idx, shard_budget=SHARD_BUDGET):
     """
-    Shard count so that NO round exceeds 1.0 epoch. See research-program.md 1.2.
+    Tokens in one pass over this round's data. This is the run length - there is no
+    clock, and every experiment in the round trains on exactly this many tokens.
 
-    A round that repeats data measures memorization, not the change under test, so its
-    verdicts do not transfer upward. Every round trains for the same wall clock, so the
-    binding case is the round with the LEAST data - R1 at 1/4 scale. Size for that and
-    the larger rounds clear the gate automatically.
-
-    Measure `throughput_tokens_per_s` at R0 from the baseline's own summary:
-    total_tokens_M * 1e6 / training_seconds.
-
-    Rounded up to a multiple of 4 so the 1/4 and 1/2 slices are exact and the nesting
-    stays clean. The cost of the rounding is a few spare shards on disk.
+    SHARD_TOKENS is an estimate (400B / 6542), so this is accurate to a few percent.
+    The harness reports the `epoch` the dataloader actually reached; if R0 comes back
+    far from 1.0, correct SHARD_TOKENS here and the estimate is exact from then on.
     """
-    consumed = throughput_tokens_per_s * prepare.TIME_BUDGET
-    smallest_scale = min(ROUND_SCALE.values())
-    raw = math.ceil(headroom * consumed / (SHARD_TOKENS * smallest_scale))
-    return max(4, 4 * math.ceil(raw / 4))
+    return len(round_shards(round_idx, shard_budget)) * SHARD_TOKENS
 
 
-def epochs_per_round(throughput_tokens_per_s, shard_budget=SHARD_BUDGET):
-    """{round: epochs consumed}. Every value must be < 1.0 before a round opens."""
-    consumed = throughput_tokens_per_s * prepare.TIME_BUDGET
-    out = {}
-    for r in ROUND_SCALE:
-        fresh = len(round_shards(r, shard_budget)) * SHARD_TOKENS
-        out[r] = consumed / fresh
-    return out
+def estimated_runtime_s(round_idx, throughput_tokens_per_s, shard_budget=SHARD_BUDGET):
+    """
+    Wall clock one run of this round will take, for planning a night's work.
+
+    Nothing enforces this - it is how long one pass costs, not a budget. Measure
+    `throughput_tokens_per_s` at R0: total_tokens_M * 1e6 / training_seconds.
+    """
+    return round_tokens(round_idx, shard_budget) / throughput_tokens_per_s
 
 
 def fetch_test_shard():
@@ -148,7 +152,7 @@ def prepare_round(round_idx, shard_budget=SHARD_BUDGET, verbose=True):
         scale = ROUND_SCALE[round_idx]
         tok = len(train_ids) * SHARD_TOKENS / 1e9
         print(f"Round {round_idx}: scale {scale:g} | {len(train_ids)} train shards "
-              f"(~{tok:.2f}B tokens) | budget {prepare.TIME_BUDGET}s (fixed, all rounds)")
+              f"| run length ~{tok:.2f}B tokens (one pass, no time limit)")
         print(f"  DATA_DIR -> {round_dir}")
         print(f"  val shard {prepare.VAL_SHARD}"
               + (f" + TEST shard {TEST_SHARD}" if round_idx == 3 else " (TEST shard withheld)"))
@@ -164,17 +168,18 @@ def _check():
     assert len(round_shards(3)) == SHARD_BUDGET
     # a tiny budget must still yield at least one shard, not zero
     assert round_shards(1, shard_budget=2) == [0]
-    # sizing: H100 reference throughput from the upstream summary (499.6M tokens / 300s)
-    h100 = 499.6e6 / 300
-    assert required_shard_budget(h100) == 44, required_shard_budget(h100)
-    eps = epochs_per_round(h100, shard_budget=44)
-    assert all(v < 1.0 for v in eps.values()), eps
-    # R1 is the binding round now: least data, same budget as every other round
-    assert max(eps, key=eps.get) in (0, 1), "the smallest-data round must be the tightest"
-    # an undersized budget must be caught, not silently accepted
-    assert any(v >= 1.0 for v in epochs_per_round(h100, shard_budget=8).values())
+    # the compute ladder: R2 is 2x R1, R3 is 4x R1
+    t1, t2, t3 = round_tokens(1), round_tokens(2), round_tokens(3)
+    assert t2 == 2 * t1, (t1, t2)
+    assert t3 == 4 * t1, (t1, t3)
+    assert round_tokens(0) == t1, "R0 must train exactly like an R1 run, or sigma is wrong"
+    # runtime scales with the ladder, it is not capped
+    h100 = 499.6e6 / 300           # upstream summary: 499.6M tokens in 300s
+    rt = {r: estimated_runtime_s(r, h100) for r in ROUND_SCALE}
+    assert rt[3] > rt[2] > rt[1], rt
     print("data.py self-check passed")
-    print("  H100 reference:", {k: round(v, 3) for k, v in eps.items()}, "epochs/round")
+    print(f"  tokens/run: R1 {t1/1e9:.2f}B  R2 {t2/1e9:.2f}B  R3 {t3/1e9:.2f}B")
+    print("  H100 runtime/run:", {k: f"{v/60:.0f}min" for k, v in rt.items()})
 
 
 if __name__ == "__main__":

@@ -9,9 +9,11 @@ with different configs and different seeds in one process.
 Three things it changes from train.py, deliberately:
   1. Hyperparameters are an `ExpConfig` dataclass, not module globals, so a notebook can
      hold several configs at once and so the exact config lands in metrics.json.
-  2. The time budget is a config field rather than a module constant, but it defaults to
-     prepare.TIME_BUDGET and every round uses that same value - rounds differ by data
-     scale alone. Change it only to deliberately study the budget itself.
+  2. There is NO time limit. upstream stops at prepare.TIME_BUDGET seconds; a run here
+     stops after `cfg.train_tokens`, which defaults to one pass over the round's data.
+     The LR schedule is driven by token progress rather than elapsed seconds, so a run
+     is reproducible and its schedule completes identically on any hardware - only the
+     wall clock differs.
   3. A NaN/exploding loss raises `TrainingDiverged` instead of calling exit(1), which
      in a notebook would kill the kernel and lose the log.
 
@@ -44,6 +46,7 @@ import torch
 import prepare
 from prepare import Tokenizer, make_dataloader, evaluate_bpb
 
+from .data import round_shards, round_tokens
 from .model import GPT, GPTConfig
 
 # bf16 peak FLOPS, for the MFU number only. train.py hardcodes the H100 value; keeping it
@@ -69,9 +72,11 @@ class ExpConfig:
     # --- round wiring (set these; they are not hyperparameters to tune) ---
     round_idx: int = 1
     seed: int = 0
-    # Fixed for the whole project (upstream's 5 minutes). Rounds differ by data scale,
-    # not by time, so every run is compared against runs that trained equally long.
-    time_budget: float = float(prepare.TIME_BUDGET)
+    # Run length, in tokens. None -> one pass over this round's data (the default, and
+    # what makes compute scale with data: R1 1x, R2 2x, R3 4x). There is no clock; a run
+    # takes as long as one pass costs on this machine. Set it explicitly only to study
+    # run length itself, and then say so in the report.
+    train_tokens: float = None
 
     # --- model architecture ---
     depth: int = 8                   # number of transformer layers
@@ -95,6 +100,10 @@ class ExpConfig:
     # --- bookkeeping ---
     gpu: str = "default"             # key into PEAK_FLOPS, for the MFU figure only
     notes: str = ""
+
+    def __post_init__(self):
+        if self.train_tokens is None:
+            self.train_tokens = float(round_tokens(self.round_idx))
 
     def model_dim(self):
         base = self.depth * self.aspect_ratio
@@ -172,10 +181,15 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
 
     train_loader = make_dataloader(tokenizer, cfg.device_batch_size, prepare.MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)   # prefetch
+    planned_steps = max(1, int(cfg.train_tokens // cfg.total_batch_size))
     if not quiet:
-        print(f"Time budget: {cfg.time_budget}s | grad accum steps: {grad_accum_steps}")
+        print(f"Train tokens: {cfg.train_tokens/1e6:.1f}M (~{planned_steps} steps, no time limit) "
+              f"| grad accum steps: {grad_accum_steps}")
 
-    # --- schedules: identical to upstream, but read the config's budget ---
+    # --- schedules: upstream's shapes, but progress is measured in tokens, not seconds.
+    # Upstream divides elapsed time by TIME_BUDGET, which makes the LR schedule depend on
+    # how fast the machine is. Token progress makes a run bit-reproducible across
+    # hardware, and it is why there is no clock anywhere below. ---
     def get_lr_multiplier(progress):
         if progress < cfg.warmup_ratio:
             return progress / cfg.warmup_ratio if cfg.warmup_ratio > 0 else 1.0
@@ -192,7 +206,8 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
     t_start_training = time.time()
     history = []        # (step, wall_clock, smoothed_loss, lrm, tok_per_s) - the loss curve
     smooth_train_loss = 0.0
-    total_training_time = 0.0
+    total_training_time = 0.0   # measured, for throughput/MFU only. Never a stop condition.
+    tokens_seen = 0
     step = 0
     gc_was_enabled = gc.isenabled()
 
@@ -207,7 +222,8 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
                 (loss / grad_accum_steps).backward()
                 x, y, epoch = next(train_loader)
 
-            progress = min(total_training_time / cfg.time_budget, 1.0)
+            tokens_seen += cfg.total_batch_size
+            progress = min(tokens_seen / cfg.train_tokens, 1.0)
             lrm = get_lr_multiplier(progress)
             muon_momentum = get_muon_momentum(step)
             muon_weight_decay = cfg.weight_decay * (1 - progress)
@@ -238,18 +254,18 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
             if step % log_every == 0:
                 history.append((step, total_training_time, debiased, lrm, tok_per_sec))
             if not quiet:
-                remaining = max(0, cfg.time_budget - total_training_time)
-                print(f"\rstep {step:05d} ({100 * progress:.1f}%) | loss: {debiased:.6f} | "
-                      f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-                      f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-                      end="", flush=True)
+                left = (planned_steps - step) * dt
+                print(f"\rstep {step:05d}/{planned_steps} ({100 * progress:.1f}%) | "
+                      f"loss: {debiased:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | "
+                      f"tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | "
+                      f"eta: {left/60:.1f}min    ", end="", flush=True)
 
             if step == 0:
                 gc.collect(); gc.freeze(); gc.disable()
             elif (step + 1) % 5000 == 0:
                 gc.collect()
             step += 1
-            if step > 10 and total_training_time >= cfg.time_budget:
+            if tokens_seen >= cfg.train_tokens:
                 break
     finally:
         # run_seeds calls this repeatedly in one process; leaving GC disabled would
@@ -267,7 +283,7 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
         val_bpb = evaluate_bpb(model, tokenizer, cfg.device_batch_size)
 
     t_end = time.time()
-    total_tokens = step * cfg.total_batch_size
+    total_tokens = tokens_seen
     steady_mfu = (100 * num_flops_per_token * cfg.total_batch_size * (step - 10)
                   / total_training_time / peak_flops) if total_training_time > 0 else 0.0
     metrics = {
@@ -282,6 +298,7 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
         "num_params_M": round(num_params / 1e6, 1),
         "depth": cfg.depth,
         "epoch": float(epoch),
+        "train_tokens_M": round(cfg.train_tokens / 1e6, 1),
         "final_train_loss": round(history[-1][2], 6) if history else None,
         "config": asdict(cfg),
     }
@@ -292,10 +309,17 @@ def run(cfg, outdir=None, log_every=1, quiet=False):
               "total_tokens_M", "num_steps", "num_params_M", "depth"):
         v = metrics[k]
         print(f"{k + ':':18s}{v:.6f}" if k == "val_bpb" else f"{k + ':':18s}{v}")
-    print(f"{'epoch:':18s}{metrics['epoch']:.3f}   # VALIDITY GATE - must be < 1.0")
-    if metrics["epoch"] >= 1.0:
-        print("WARNING: epoch >= 1.0. This round repeated data; the result is "
-              "repetition-confounded and must not be promoted. Raise SHARD_BUDGET.")
+    print(f"{'epoch:':18s}{metrics['epoch']:.3f}   # one pass by design; ~1.0 expected")
+    if metrics["epoch"] > 1.3 or metrics["epoch"] < 0.7:
+        # train_tokens came from SHARD_TOKENS, an estimate. The dataloader's own epoch
+        # counter is ground truth, so it tells us what the estimate should have been.
+        n_shards = len(round_shards(cfg.round_idx))
+        actual = cfg.train_tokens / metrics["epoch"] / n_shards
+        print(f"WARNING: epoch {metrics['epoch']:.2f}, not ~1.0. SHARD_TOKENS in "
+              f"_shared/data.py is wrong for this corpus; set it to ~{int(actual):,} "
+              "so a run is one pass. Results so far are still internally comparable "
+              "(every run in the round used the same train_tokens), but the round is "
+              "not the data scale it claims to be.")
 
     if outdir:
         _write_artifacts(outdir, metrics, history, cfg)

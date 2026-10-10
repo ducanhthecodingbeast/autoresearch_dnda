@@ -25,9 +25,9 @@ The upstream baseline instructions this file used to hold are in git history
      `_shared/model.py` against it.
 3. **Check the data.** `uv run python experiments/exp00r0/preprocessing.py` tells you
    what is missing and the exact command to fix it.
-4. **Run Round 0.** `experiments/exp00r0/train.ipynb`. It produces the baseline,
-   the platform throughput that sizes `SHARD_BUDGET`, and σ₀ — the noise band every
-   later verdict is measured against.
+4. **Run Round 0.** `experiments/exp00r0/train.ipynb`. It produces the baseline, the
+   per-round runtimes for this machine, and σ₀ — the noise band every later verdict is
+   measured against.
 5. **Stop.** Write `experiments/exp00r0/report.md`, propose `rounds/r1-directions.md`,
    and wait for the human. Round 1 does not open on your own authority.
 
@@ -59,9 +59,10 @@ These are the ones that look like harmless shortcuts in the moment:
   is a greedy walk on seed noise.
 - **One change per experiment.** Two changes is two experiments. Otherwise the ledger
   records an effect you cannot attribute.
-- **`epoch` must be < 1.0.** Printed in every summary. Above it, the run repeated its
-  data and the result is invalid regardless of `val_bpb`. R1 is the tightest round for
-  this — least data, same 300 s as every other round.
+- **There is no time limit.** A run ends after one pass over its round's data
+  (`cfg.train_tokens`). Do not add a clock, do not cut a run short, and do not compare a
+  run against one with a different `train_tokens`. `epoch` in the summary should be
+  ~1.0; far off means `SHARD_TOKENS` needs correcting and the harness prints the value.
 - **Never look at `TEST_SHARD` (6541) before the Round 3 gate.** It is the only
   instrument that can tell you whether three rounds of hill-climbing overfit the
   validation shard.

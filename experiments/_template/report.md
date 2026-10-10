@@ -29,7 +29,7 @@ The example numbers in research-program.md section 5 show a filled-in version.
 
 # exp&lt;NN&gt;r&lt;R&gt; — &lt;short title&gt;
 
-**Round** &lt;R&gt; (&lt;scale&gt; data, &lt;N&gt; shards, 300 s) · **Parent** &lt;exp id&gt;
+**Round** &lt;R&gt; (&lt;scale&gt; data, &lt;N&gt; shards, one pass) · **Parent** &lt;exp id&gt;
 **Hypothesis** &lt;one sentence, falsifiable: what should move, and in which direction&gt;
 **Change** &lt;the delta against the parent. one axis. nothing else changed.&gt;
 
@@ -42,10 +42,11 @@ The example numbers in research-program.md section 5 show a filled-in version.
 | peak_vram_mb | | | | |
 | mfu_percent | | | | |
 | tok_per_s | | | | |
+| training_seconds (outcome, not a budget) | | | | |
 | total_tokens_M | | | | |
 | num_steps | | | | |
 | num_params_M | | | | |
-| epoch (validity, must be < 1.0) | | | | |
+| epoch (one pass by design, ~1.0) | | | | |
 
 σ&lt;R&gt; = &lt;value&gt; (from the round baseline's seed repeats). Threshold to keep: Δ < &lt;−2σ&gt;.
 
