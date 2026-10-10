@@ -4,17 +4,21 @@
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+**This is a fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch)** that runs a different research loop. The upstream idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up to a log of experiments and (hopefully) a better model. The training code is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat), and you program the agent by editing Markdown, not Python. Upstream context: [tweet](https://x.com/karpathy/status/2029701092347630069), [this tweet](https://x.com/karpathy/status/2031135152349524125).
+
+**What this fork changes:** the overnight loop is replaced by a **three-round protocol with human gates**. Rounds run at 1/4, 1/2 and full data with 120s/300s/900s budgets, and the agent stops for review at the end of each one. A result is only kept if it clears **2 sigma** of measured seed noise, rather than merely coming out lower. The protocol lives in [`research-program.md`](research-program.md); the agent's entry point is [`program.md`](program.md). Details in [This fork](#this-fork-a-three-round-protocol-with-human-gates) below.
 
 ## How it works
 
-The repo is deliberately kept small and only really has three files that matter:
+The files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). **Read-only.** The `evaluate_bpb` function in it is the ground-truth metric and is never edited, wrapped or reimplemented.
+- **`experiments/_shared/`** — what the agent actually edits. `model.py` (GPT + Muon/AdamW, extracted verbatim from `train.py`), `harness.py` (the run loop), `data.py` (round → data scale), `ledger.py` (the keep/discard rule).
+- **`experiments/exp<NN>r<R>/`** — one folder per experiment, each with a `preprocessing.py`, a `train.ipynb`, and a `report.md` carrying benchmarks, a score, an assessment, and numbered evidence for every claim.
+- **`research-program.md`** — the protocol: rounds, decision rule, folder contracts, report format. **This file is edited and iterated on by the human** — it is this fork's "research org code".
+- **`train.py`** — upstream's single-file script. Kept unmodified as a reference to diff against; not run after Round 0.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+Training runs for a **per-round time budget** (120s / 300s / 900s) rather than upstream's fixed 5 minutes, so the rounds form a cheap-to-expensive ladder. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared. Every run also reports `epoch`, which must stay below 1.0: a round that repeats its data is measuring memorization, not the change under test.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
@@ -112,13 +116,18 @@ uv run python -m experiments._shared.ledger --check   # the 2-sigma decision rul
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **Wall-clock budgets, not step counts.** Experiments are compared at equal time, so a change to model size, batch size or architecture is judged on what it delivers per second rather than per step. Upstream fixes this at 5 minutes; this fork scales it per round (120s / 300s / 900s) so screening is cheap and the final round is thorough. The trade-off is unchanged: results are optimal *for your platform* and not comparable with someone else's hardware.
+- **Decisions are statistical, not greedy.** Three seed repeats of each round's baseline give a sigma; a change is kept only if it moves `val_bpb` by more than 2 of them. This costs runs, and it is the point — at these budgets a seed reshuffle moves the metric enough that a greedy keep-if-lower loop spends the night accumulating noise.
+- **The metric is untouchable.** `prepare.py` is read-only and `evaluate_bpb` is never wrapped or reimplemented. Everything the agent can reach is on the other side of that line.
+- **Validation is held out twice.** A pinned validation shard scores every run, and a separate test shard stays sealed until the Round 3 gate. Three rounds of hill-climbing on one shard will overfit it; `test_bpb - val_bpb` is how you find out by how much.
+- **Every run leaves a report.** Benchmarks, a score, an assessment, and numbered evidence for each claim. A result nobody can audit later is not a result — and null results get the same treatment as wins, because the round assessments are built from them.
+- **Self-contained.** PyTorch, a few small packages, and Jupyter to execute the notebooks. No distributed training, no complex configs. One GPU, one metric.
 
 ## Platform support
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+This code currently requires a single NVIDIA GPU. Supporting CPU, MPS and other platforms is quite possible in principle but would bloat the code, and upstream has not taken it on. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms.
+
+The sections below (small-compute tuning advice, notable forks) are upstream's and apply to the training code, which this fork has not changed.
 
 Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
 
