@@ -10,7 +10,7 @@ publish the three numbers the rest of the project depends on.
 
 # exp00r0 — baseline + noise measurement
 
-**Round** 0 (1/4 data, &lt;N&gt; shards, 120 s) · **Parent** none — this is the baseline
+**Round** 0 (1/4 data, &lt;N&gt; shards, 300 s) · **Parent** none — this is the baseline
 **Hypothesis** None. Round 0 measures the instrument rather than testing an idea.
 **Change** None. Upstream `train.py` defaults, unmodified.
 
@@ -62,8 +62,9 @@ effect smaller than that are not worth the run.
 | R3 epochs (must be < 1.0) | |
 
 &lt;If any round is ≥ 1.0, say so here and raise `SHARD_BUDGET` in
-`experiments/_shared/data.py` before Round 1 opens. Do not shorten a time budget to
-bring a round under the gate — that changes what the round measures.&gt;
+`experiments/_shared/data.py` before Round 1 opens. Do not shorten a run to bring a
+round under the gate — the budget is fixed across rounds precisely so results stay
+comparable, and R1 is the binding case here: least data, same 300 s as every round.&gt;
 
 ## Assessment
 

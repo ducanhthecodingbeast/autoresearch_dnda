@@ -60,7 +60,8 @@ These are the ones that look like harmless shortcuts in the moment:
 - **One change per experiment.** Two changes is two experiments. Otherwise the ledger
   records an effect you cannot attribute.
 - **`epoch` must be < 1.0.** Printed in every summary. Above it, the run repeated its
-  data and the result is invalid regardless of `val_bpb`.
+  data and the result is invalid regardless of `val_bpb`. R1 is the tightest round for
+  this — least data, same 300 s as every other round.
 - **Never look at `TEST_SHARD` (6541) before the Round 3 gate.** It is the only
   instrument that can tell you whether three rounds of hill-climbing overfit the
   validation shard.

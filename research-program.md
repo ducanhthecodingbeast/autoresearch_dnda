@@ -11,27 +11,38 @@ Three experiment rounds on a cheap→expensive ladder, plus a setup round.
 The agent **stops dead** at the end of each round and does not start the next one
 until the human approves the round assessment.
 
-| Round | Data scale | Time budget | Purpose |
+| Round | Data scale | Runs (guide) | Purpose |
 |---|---|---|---|
-| **R0** | 1/4 | 120 s | Baseline + noise measurement. Not an experiment round. |
-| **R1** | **1/4** | **120 s** | Wide screening. Many cheap runs, coarse knobs. |
-| **R2** | **1/2** | **300 s** | Confirm R1 survivors, tune what held. |
-| **R3** | **full** | **900 s** | Final config. Few runs. Test-shard confirmation. |
+| **R0** | 1/4 | 4 | Baseline + noise measurement. Not an experiment round. |
+| **R1** | **1/4** | ~25 | Wide screening. Coarse knobs, one axis each. |
+| **R2** | **1/2** | ~12 | Confirm R1 survivors at more data. |
+| **R3** | **full** | ~5 | Final config. Test-shard confirmation. |
 
-### 1.1 Why the time budget scales too
+**Every round trains for the same wall clock**: `prepare.TIME_BUDGET`, 300 s, upstream's
+fixed 5 minutes. Data scale is the only axis that changes between rounds.
 
-Data scale alone does not make a round cheaper or more expensive. The upstream design
-fixes wall-clock at 300 s, so a run consumes the same token count whatever the dataset
-size — scaling data from 1/4 to full would change only *which* documents are seen and
-how often they repeat, at identical cost. The rounds would differ by nothing that shows
-up in a budget.
+### 1.1 What the rounds actually vary
 
-Scaling the budget alongside the data gives the ladder real teeth: R1 buys ~2.5× the
-experiments per hour, R3 buys the longest-horizon result. Data scale then also binds,
-because a longer run needs more fresh data to stay inside one epoch.
+One thing: **how much distinct data the model sees**. Every run gets the same 300 s and
+therefore consumes the same token count, so two runs are never separated by one of them
+having trained longer. A Round 1 result and a Round 3 result differ only in the diversity
+of the text behind them.
 
-If you want the pure data-only axis instead, set all three budgets to 300 s and keep
-everything else. The protocol does not otherwise depend on the ladder.
+That makes each round a specific question:
+
+- **R1** — does this change help at all, on a narrow slice?
+- **R2** — does it still help when the data is twice as varied, or was it an artefact of
+  the slice?
+- **R3** — does it survive on the full corpus, and did three rounds of selection overfit
+  the validation shard?
+
+A change that wins in R1 and evaporates in R2 was fitting the slice, not the problem.
+That is a finding, and the round assessment records it as one.
+
+**The cost ladder comes from run counts, not run length.** Rounds cost the same per run,
+so R1's cheapness is a matter of spending the runs there: roughly 25 in R1, 12 in R2,
+5 in R3. Those are guides for planning a round, not gates — the round closes when the
+direction list is exhausted or the human calls it.
 
 ### 1.2 Sizing the dataset — the epoch rule
 
@@ -42,10 +53,14 @@ memorization, not the change under test, and its verdicts do not transfer upward
 Size the shard budget from measured throughput, not from a guess:
 
 ```
-shard_tokens   ~= 61M                       # 400B ClimbMix / 6542 shards
-R3_tokens       = throughput * 900          # measured at R0
-SHARD_BUDGET    = ceil(1.25 * R3_tokens / shard_tokens)   # 25% headroom
+shard_tokens   ~= 61M                             # 400B ClimbMix / 6542 shards
+consumed        = throughput * 300                # same for every round
+SHARD_BUDGET    = ceil(1.25 * consumed / (shard_tokens * 0.25))   # 25% headroom
 ```
+
+The binding round is **R1**: least data, same wall clock as every other round. Size for
+R1 and R2/R3 clear the gate automatically — the opposite of what you would expect, and
+the reason the budget is computed against the *smallest* scale.
 
 Round slices are nested, so R2 and R3 include everything the earlier rounds saw:
 
@@ -55,12 +70,15 @@ Round slices are nested, so R2 and R3 include everything the earlier rounds saw:
 | R2 | `0 .. SHARD_BUDGET/2 - 1` | 1/2 |
 | R3 | `0 .. SHARD_BUDGET - 1` | full |
 
+`SHARD_BUDGET` is rounded up to a multiple of 4 so the 1/4 and 1/2 slices are exact.
+
 **Worked default (H100, ~1.67M tok/s from the upstream summary):**
-`R3_tokens` = 1.5B → `SHARD_BUDGET` = **32** shards (~1.95B tokens, ~6.4 GB on disk).
-R1 = 8 shards / 0.41 epochs, R2 = 16 / 0.51, R3 = 32 / 0.77. All clear.
+a run consumes ~500M tokens → `SHARD_BUDGET` = **44** shards (~2.7B tokens, ~8.8 GB on
+disk). R1 = 11 shards / 0.745 epochs, R2 = 22 / 0.372, R3 = 44 / 0.186. All clear.
 
 Recompute this at R0 for the actual platform. If any round lands above 1.0 epoch,
-raise `SHARD_BUDGET` — never lower the time budget to hide it.
+raise `SHARD_BUDGET` — never shorten a run to hide it, because that would make the
+round's results incomparable with every other round.
 
 ### 1.3 Gates
 
@@ -70,7 +88,7 @@ raise `SHARD_BUDGET` — never lower the time budget to hide it.
 3. Three repeated baseline runs, seeds 0/1/2 → gives **σ₀**, the noise band (§4).
 
 **Round exit gate** — a round closes when the direction list is exhausted or the run
-budget is spent. The agent writes `rounds/rN-assessment.md` (§6), then stops.
+allocation is spent. The agent writes `rounds/rN-assessment.md` (§6), then stops.
 
 ---
 
@@ -211,7 +229,7 @@ Cells, in order:
 3. **Config** — every hyperparameter as one flat dict, printed. Nothing hidden in
    defaults; the printed dict is what the report cites.
 4. **Train** — the loop from `_shared/harness.py`. Logs step, loss, lr, tok/s, VRAM,
-   epoch to a list. Honours the round time budget.
+   epoch to a list. Uses `prepare.TIME_BUDGET` — the same for every round.
 5. **Eval** — `prepare.evaluate_bpb(model, tokenizer, batch_size)`, unmodified.
 6. **Metrics** — write `metrics.json`, print the upstream summary block verbatim
    (`val_bpb:`, `peak_vram_mb:`, … — same keys as `train.py`, so `grep` still works).
@@ -225,7 +243,7 @@ uv run jupyter nbconvert --to notebook --execute --inplace \
   experiments/exp01r1/train.ipynb > experiments/exp01r1/run.log 2>&1
 ```
 
-Kill and mark `crash` if a run exceeds **3× its round time budget**.
+Kill and mark `crash` if a run exceeds **3× `prepare.TIME_BUDGET`** (15 minutes).
 
 ---
 
@@ -272,7 +290,7 @@ Every experiment folder has one. No run is "done" without it. Numbers are copied
 ```markdown
 # exp01r1 — <short title>
 
-**Round** 1 (1/4 data, 8 shards, 120 s budget) · **Parent** exp00r1 (baseline)
+**Round** 1 (1/4 data, 11 shards) · **Parent** exp00r1 (baseline)
 **Hypothesis** <one sentence, falsifiable: what should move, and in which direction>
 **Change** <the delta, as a param table or diff. nothing else changed.>
 
@@ -321,8 +339,8 @@ TEST_SHARD bpb (Round 3 only), and a qualitative sample.
 ## Threats to validity
 
 <what could still be wrong. e.g. only tested at depth 8; interacts with LR, untested;
-1/4 data and a 120 s budget, so this may not hold at R3 scale. Say what R2 must
-re-check.>
+1/4 data, so this may be an artefact of the slice rather than a real effect. Say what
+R2 must re-check.>
 
 ## Carry forward
 
@@ -392,15 +410,23 @@ against. Upstream defaults for reference: `DEPTH=8`, `ASPECT_RATIO=64` (dim 512)
 `HEAD_DIM=128`, `WINDOW_PATTERN="SSSL"`, `TOTAL_BATCH_SIZE=2**19`, `MATRIX_LR=0.04`
 (Muon), `EMBEDDING_LR=0.6`, `WARMDOWN_RATIO=0.5`.
 
+**A caution on expected yield.** Runs here are 300 s, which is the budget upstream tuned
+these defaults at — roughly 950 steps. So every schedule- and LR-shaped knob starts at or
+near its tuned optimum, and the easy wins that come from running at a budget the defaults
+were *not* tuned for are not available. Expect small effects and a low keep rate, and
+expect σ to matter more than usual: a direction whose plausible effect is under ~2σ is
+not worth the runs. The honest high-yield directions are the ones upstream tuned least,
+which is why the architecture axes rank above the schedule ones below.
+
 | # | Direction | Why it should matter | Cost |
 |---|---|---|---|
-| 1 | **Learning rate scale**: `MATRIX_LR` ×{0.5, 1, 2}, then `EMBEDDING_LR`, then `UNEMBEDDING_LR` | Historically the highest-yield knob whenever the budget changes. R1 runs at 120 s are ~380 steps against the ~950 the defaults were tuned for, and the optimum LR moves with step count. | 4–6 runs |
-| 2 | **Depth vs width at fixed params**: depth 6/8/12 with `ASPECT_RATIO` compensating | `ASPECT_RATIO=64` is one tuned point, not a law. Cheap, and it sets the arena every later experiment runs in — so it goes early or not at all. | 3–4 runs |
-| 3 | **Schedule**: `WARMDOWN_RATIO` {0.3, 0.5, 0.7}, `WARMUP_RATIO` {0, 0.02}, `FINAL_LR_FRAC` | Schedule fractions interact directly with total step count, which the round ladder changes by 7.5×. Expect the R1 optimum to differ from R3's — which is itself a useful finding. | 4 runs |
-| 4 | **`TOTAL_BATCH_SIZE`**: 2**18 / 2**19 / 2**20 | Critical batch size scales with model size and budget. Interacts strongly with #1, so run it *after* the LR scale is known, not in parallel. | 3 runs |
-| 5 | **Attention window**: `WINDOW_PATTERN` "SSSL" vs "L" vs "SSSSSSSL" | Trades context for throughput. The banded pattern's payoff depends on depth and seq len, both of which #2 may move. | 3 runs |
-| 6 | **Optimizer ablation**: Muon off (AdamW everywhere), Muon momentum schedule, `WEIGHT_DECAY` | Simplification candidate. If Muon's edge is small at this scale, dropping it deletes ~60 lines — a keep under §7 even at Δ ≈ 0. Measure before assuming. | 3–4 runs |
-| 7 | **`HEAD_DIM`** 64 vs 128 at fixed dim | Changes head count and attention FLOPs per param. Small expected effect, cheap to settle, and it unblocks #5. | 2 runs |
+| 1 | **Depth vs width at fixed params**: depth 6/8/12 with `ASPECT_RATIO` compensating | `ASPECT_RATIO=64` is one tuned point, not a law, and it is the axis upstream explored least. It also sets the arena every later experiment runs in — so it goes early or not at all. | 3–4 runs |
+| 2 | **Attention window**: `WINDOW_PATTERN` "SSSL" vs "L" vs "SSSSSSSL" | Trades context for throughput, and throughput converts directly into steps at a fixed budget. The banded pattern's payoff depends on depth, which #1 may move, so run it after. | 3 runs |
+| 3 | **Optimizer ablation**: Muon off (AdamW everywhere), Muon momentum schedule, `WEIGHT_DECAY` | Simplification candidate. If Muon's edge is small here, dropping it deletes ~60 lines — a keep under §7 even at Δ ≈ 0. The one direction where a null result is still a win. | 3–4 runs |
+| 4 | **`TOTAL_BATCH_SIZE`**: 2\*\*18 / 2\*\*19 / 2\*\*20 | Critical batch size scales with model size, and #1 moves model size. Interacts with LR, so pair the winner with #5 rather than testing in isolation. | 3 runs |
+| 5 | **Learning rate scale**: `MATRIX_LR` ×{0.5, 1, 2}, then `EMBEDDING_LR` | Normally the first thing to tune, demoted here precisely because the budget now matches upstream's tuning point — the defaults should already be close. Worth confirming once, and worth re-testing against whatever #1 and #4 settle on. | 4 runs |
+| 6 | **`HEAD_DIM`** 64 vs 128 at fixed dim | Changes head count and attention FLOPs per param. Small expected effect, cheap to settle, and it feeds #2. | 2 runs |
+| 7 | **Schedule**: `WARMDOWN_RATIO` {0.3, 0.5, 0.7}, `WARMUP_RATIO` {0, 0.02}, `FINAL_LR_FRAC` | Lowest expected yield of the list: schedule fractions are tuned against step count, and at 300 s the step count is the one they were tuned at. Run only if the round has spare allocation. | 4 runs |
 
 Not in R1, and why: `vocab_size` (needs a tokenizer retrain, which moves a §2 constant);
 fp8 (debugging cost would eat the round); any downstream eval (chance-level here, per §5).

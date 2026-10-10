@@ -29,7 +29,7 @@ The example numbers in research-program.md section 5 show a filled-in version.
 
 # exp&lt;NN&gt;r&lt;R&gt; — &lt;short title&gt;
 
-**Round** &lt;R&gt; (&lt;scale&gt; data, &lt;N&gt; shards, &lt;budget&gt;s) · **Parent** &lt;exp id&gt;
+**Round** &lt;R&gt; (&lt;scale&gt; data, &lt;N&gt; shards, 300 s) · **Parent** &lt;exp id&gt;
 **Hypothesis** &lt;one sentence, falsifiable: what should move, and in which direction&gt;
 **Change** &lt;the delta against the parent. one axis. nothing else changed.&gt;
 
@@ -79,8 +79,8 @@ hypothesis — confirmed, refuted, or neither — and name the number that decid
 
 &lt;What could still be wrong. Be specific and name what the next round must re-check.
 The standing ones worth checking every time: only tested at one depth; untested
-interaction with LR or batch size; measured at this round's reduced data scale and
-shorter budget, so it may not survive the next round.&gt;
+interaction with LR or batch size; measured on this round's narrower data slice, so it
+may be fitting the slice rather than the problem.&gt;
 
 ## Carry forward
 

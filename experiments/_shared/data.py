@@ -29,12 +29,15 @@ import prepare
 
 # --- Project constants. Section 2 of research-program.md. Pin once, never per-run. ---
 
-SHARD_BUDGET = 32          # "full dataset". Derive it from measured throughput (see below).
+SHARD_BUDGET = 44          # "full dataset". Derive it from measured throughput (see below).
 TEST_SHARD = 6541          # held out until the Round 3 gate. VAL_SHARD (6542) is prepare.py's.
 SHARD_TOKENS = 61_000_000  # ~400B ClimbMix tokens / 6542 shards
 
-ROUND_SCALE = {0: 0.25, 1: 0.25, 2: 0.5, 3: 1.0}   # section 1
-ROUND_BUDGET = {0: 120, 1: 120, 2: 300, 3: 900}    # seconds of training wall clock
+ROUND_SCALE = {0: 0.25, 1: 0.25, 2: 0.5, 3: 1.0}   # section 1. the ONLY round axis.
+
+# Every round trains for the same wall clock: prepare.TIME_BUDGET (300s, upstream's
+# fixed 5 minutes). Rounds differ by data scale alone, so a result is never confounded
+# by having had more training time than the run it is compared against.
 
 
 def round_shards(round_idx, shard_budget=SHARD_BUDGET):
@@ -49,25 +52,29 @@ def required_shard_budget(throughput_tokens_per_s, headroom=1.25):
     Shard count so that NO round exceeds 1.0 epoch. See research-program.md 1.2.
 
     A round that repeats data measures memorization, not the change under test, so its
-    verdicts do not transfer upward. Round 3 is the binding case: it has the longest
-    budget, and its scale is 1.0, so sizing for R3 covers R1 and R2 automatically.
+    verdicts do not transfer upward. Every round trains for the same wall clock, so the
+    binding case is the round with the LEAST data - R1 at 1/4 scale. Size for that and
+    the larger rounds clear the gate automatically.
+
     Measure `throughput_tokens_per_s` at R0 from the baseline's own summary:
     total_tokens_M * 1e6 / training_seconds.
 
     Rounded up to a multiple of 4 so the 1/4 and 1/2 slices are exact and the nesting
     stays clean. The cost of the rounding is a few spare shards on disk.
     """
-    r3_tokens = throughput_tokens_per_s * ROUND_BUDGET[3]
-    raw = math.ceil(headroom * r3_tokens / SHARD_TOKENS)
+    consumed = throughput_tokens_per_s * prepare.TIME_BUDGET
+    smallest_scale = min(ROUND_SCALE.values())
+    raw = math.ceil(headroom * consumed / (SHARD_TOKENS * smallest_scale))
     return max(4, 4 * math.ceil(raw / 4))
 
 
 def epochs_per_round(throughput_tokens_per_s, shard_budget=SHARD_BUDGET):
     """{round: epochs consumed}. Every value must be < 1.0 before a round opens."""
+    consumed = throughput_tokens_per_s * prepare.TIME_BUDGET
     out = {}
-    for r, budget in ROUND_BUDGET.items():
+    for r in ROUND_SCALE:
         fresh = len(round_shards(r, shard_budget)) * SHARD_TOKENS
-        out[r] = (throughput_tokens_per_s * budget) / fresh
+        out[r] = consumed / fresh
     return out
 
 
@@ -141,7 +148,7 @@ def prepare_round(round_idx, shard_budget=SHARD_BUDGET, verbose=True):
         scale = ROUND_SCALE[round_idx]
         tok = len(train_ids) * SHARD_TOKENS / 1e9
         print(f"Round {round_idx}: scale {scale:g} | {len(train_ids)} train shards "
-              f"(~{tok:.2f}B tokens) | budget {ROUND_BUDGET[round_idx]}s")
+              f"(~{tok:.2f}B tokens) | budget {prepare.TIME_BUDGET}s (fixed, all rounds)")
         print(f"  DATA_DIR -> {round_dir}")
         print(f"  val shard {prepare.VAL_SHARD}"
               + (f" + TEST shard {TEST_SHARD}" if round_idx == 3 else " (TEST shard withheld)"))
@@ -150,17 +157,20 @@ def prepare_round(round_idx, shard_budget=SHARD_BUDGET, verbose=True):
 
 def _check():
     # nesting
-    assert round_shards(1) == list(range(8)), round_shards(1)
-    assert round_shards(2)[:8] == round_shards(1), "R2 must contain all of R1"
-    assert round_shards(3)[:16] == round_shards(2), "R3 must contain all of R2"
+    q = SHARD_BUDGET // 4
+    assert round_shards(1) == list(range(q)), round_shards(1)
+    assert round_shards(2)[:q] == round_shards(1), "R2 must contain all of R1"
+    assert round_shards(3)[:2 * q] == round_shards(2), "R3 must contain all of R2"
     assert len(round_shards(3)) == SHARD_BUDGET
     # a tiny budget must still yield at least one shard, not zero
     assert round_shards(1, shard_budget=2) == [0]
     # sizing: H100 reference throughput from the upstream summary (499.6M tokens / 300s)
     h100 = 499.6e6 / 300
-    assert required_shard_budget(h100) == 32, required_shard_budget(h100)
-    eps = epochs_per_round(h100, shard_budget=32)
+    assert required_shard_budget(h100) == 44, required_shard_budget(h100)
+    eps = epochs_per_round(h100, shard_budget=44)
     assert all(v < 1.0 for v in eps.values()), eps
+    # R1 is the binding round now: least data, same budget as every other round
+    assert max(eps, key=eps.get) in (0, 1), "the smallest-data round must be the tightest"
     # an undersized budget must be caught, not silently accepted
     assert any(v >= 1.0 for v in epochs_per_round(h100, shard_budget=8).values())
     print("data.py self-check passed")

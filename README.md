@@ -6,7 +6,7 @@
 
 **This is a fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch)** that runs a different research loop. The upstream idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up to a log of experiments and (hopefully) a better model. The training code is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat), and you program the agent by editing Markdown, not Python. Upstream context: [tweet](https://x.com/karpathy/status/2029701092347630069), [this tweet](https://x.com/karpathy/status/2031135152349524125).
 
-**What this fork changes:** the overnight loop is replaced by a **three-round protocol with human gates**. Rounds run at 1/4, 1/2 and full data with 120s/300s/900s budgets, and the agent stops for review at the end of each one. A result is only kept if it clears **2 sigma** of measured seed noise, rather than merely coming out lower. The protocol lives in [`research-program.md`](research-program.md); the agent's entry point is [`program.md`](program.md). Details in [This fork](#this-fork-a-three-round-protocol-with-human-gates) below.
+**What this fork changes:** the overnight loop is replaced by a **three-round protocol with human gates**. Rounds run at 1/4, 1/2 and full data — all at the same fixed 5-minute budget — and the agent stops for review at the end of each one. A result is only kept if it clears **2 sigma** of measured seed noise, rather than merely coming out lower. The protocol lives in [`research-program.md`](research-program.md); the agent's entry point is [`program.md`](program.md). Details in [This fork](#this-fork-a-three-round-protocol-with-human-gates) below.
 
 ## How it works
 
@@ -18,7 +18,7 @@ The files that matter:
 - **`research-program.md`** — the protocol: rounds, decision rule, folder contracts, report format. **This file is edited and iterated on by the human** — it is this fork's "research org code".
 - **`train.py`** — upstream's single-file script. Kept unmodified as a reference to diff against; not run after Round 0.
 
-Training runs for a **per-round time budget** (120s / 300s / 900s) rather than upstream's fixed 5 minutes, so the rounds form a cheap-to-expensive ladder. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared. Every run also reports `epoch`, which must stay below 1.0: a round that repeats its data is measuring memorization, not the change under test.
+Training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), the same in every round, so no run is ever compared against one that trained longer. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared. Every run also reports `epoch`, which must stay below 1.0: a round that repeats its data is measuring memorization, not the change under test.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
@@ -53,12 +53,16 @@ This fork replaces the single overnight loop with a staged protocol. The full
 specification is in **[`research-program.md`](research-program.md)**; the agent's entry
 point is [`program.md`](program.md).
 
-| Round | Data | Budget | Purpose |
+| Round | Data | Runs | Purpose |
 |---|---|---|---|
-| R0 | 1/4 | 120 s | Baseline, throughput sizing, **σ₀** (the noise band) |
-| R1 | 1/4 | 120 s | Wide screening — many cheap runs, coarse knobs |
-| R2 | 1/2 | 300 s | Confirm R1 survivors at larger scale |
-| R3 | full | 900 s | Final config, held-out test-shard confirmation |
+| R0 | 1/4 | 4 | Baseline, throughput sizing, **σ₀** (the noise band) |
+| R1 | 1/4 | ~25 | Wide screening — coarse knobs, one axis each |
+| R2 | 1/2 | ~12 | Does it still hold when the data is twice as varied? |
+| R3 | full | ~5 | Final config, held-out test-shard confirmation |
+
+Every round trains for the same 300 s. **Data scale is the only axis that changes**, so a
+change that wins in R1 and evaporates in R2 was fitting the slice, not the problem — and
+that is recorded as a finding.
 
 Three differences from upstream, each fixing something that bites over ~100 runs:
 
@@ -116,7 +120,8 @@ uv run python -m experiments._shared.ledger --check   # the 2-sigma decision rul
 
 ## Design choices
 
-- **Wall-clock budgets, not step counts.** Experiments are compared at equal time, so a change to model size, batch size or architecture is judged on what it delivers per second rather than per step. Upstream fixes this at 5 minutes; this fork scales it per round (120s / 300s / 900s) so screening is cheap and the final round is thorough. The trade-off is unchanged: results are optimal *for your platform* and not comparable with someone else's hardware.
+- **Wall-clock budgets, not step counts.** Every run gets the same 5 minutes, so a change to model size, batch size or architecture is judged on what it delivers per second rather than per step — a throughput win is a real win. The trade-off is upstream's: results are optimal *for your platform* and not comparable with someone else's hardware.
+- **Rounds vary data, nothing else.** Because the budget never changes, two runs are never separated by one having trained longer. The only difference between rounds is how much distinct text the model saw, which makes "did this survive more data?" a question the protocol can actually answer.
 - **Decisions are statistical, not greedy.** Three seed repeats of each round's baseline give a sigma; a change is kept only if it moves `val_bpb` by more than 2 of them. This costs runs, and it is the point — at these budgets a seed reshuffle moves the metric enough that a greedy keep-if-lower loop spends the night accumulating noise.
 - **The metric is untouchable.** `prepare.py` is read-only and `evaluate_bpb` is never wrapped or reimplemented. Everything the agent can reach is on the other side of that line.
 - **Validation is held out twice.** A pinned validation shard scores every run, and a separate test shard stays sealed until the Round 3 gate. Three rounds of hill-climbing on one shard will overfit it; `test_bpb - val_bpb` is how you find out by how much.

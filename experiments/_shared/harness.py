@@ -9,7 +9,9 @@ with different configs and different seeds in one process.
 Three things it changes from train.py, deliberately:
   1. Hyperparameters are an `ExpConfig` dataclass, not module globals, so a notebook can
      hold several configs at once and so the exact config lands in metrics.json.
-  2. The time budget comes from the config (the round ladder), not prepare.TIME_BUDGET.
+  2. The time budget is a config field rather than a module constant, but it defaults to
+     prepare.TIME_BUDGET and every round uses that same value - rounds differ by data
+     scale alone. Change it only to deliberately study the budget itself.
   3. A NaN/exploding loss raises `TrainingDiverged` instead of calling exit(1), which
      in a notebook would kill the kernel and lose the log.
 
@@ -18,11 +20,11 @@ behaviour. `prepare.evaluate_bpb` is called unmodified. Do not wrap it, do not
 reimplement it, do not "fix" it.
 
 Typical use:
-    from experiments._shared.data import prepare_round, ROUND_BUDGET
+    from experiments._shared.data import prepare_round
     from experiments._shared.harness import ExpConfig, run, run_seeds
 
     prepare_round(1)                       # FIRST. before any dataloader or eval.
-    cfg = ExpConfig(round_idx=1, time_budget=ROUND_BUDGET[1], matrix_lr=0.02)
+    cfg = ExpConfig(round_idx=1, matrix_lr=0.02)
     m = run(cfg, outdir="experiments/exp01r1")
 """
 
@@ -66,8 +68,10 @@ class ExpConfig:
     """
     # --- round wiring (set these; they are not hyperparameters to tune) ---
     round_idx: int = 1
-    time_budget: float = 120.0       # seconds of training wall clock, from ROUND_BUDGET
     seed: int = 0
+    # Fixed for the whole project (upstream's 5 minutes). Rounds differ by data scale,
+    # not by time, so every run is compared against runs that trained equally long.
+    time_budget: float = float(prepare.TIME_BUDGET)
 
     # --- model architecture ---
     depth: int = 8                   # number of transformer layers
